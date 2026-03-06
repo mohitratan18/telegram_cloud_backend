@@ -27,13 +27,13 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 // Rate limiting for login endpoint
-const loginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 5, // 5 attempts per window
-    message: { error: "Too many login attempts, please try again later" },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
+// const loginLimiter = rateLimit({
+//     windowMs: 15 * 60 * 1000, // 15 minutes
+//     max: 5, // 5 attempts per window
+//     message: { error: "Too many login attempts, please try again later" },
+//     standardHeaders: true,
+//     legacyHeaders: false,
+// });
 
 const upload = multer({ dest: "uploads/" });
 
@@ -49,7 +49,7 @@ const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOK
 // ============================================
 
 // Login Route
-app.post("/login", loginLimiter, async (req, res) => {
+app.post("/login", async (req, res) => {
     try {
         const { username, password } = req.body;
 
@@ -305,3 +305,6 @@ app.delete("/image/:id", verifyToken, async (req, res) => {
 app.listen(process.env.PORT, () =>
     console.log(`Server running on port ${process.env.PORT}`)
 );
+
+// Export for Vercel serverless
+module.exports = app;
