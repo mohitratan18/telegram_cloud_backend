@@ -6,9 +6,11 @@ const rateLimit = require("express-rate-limit");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
+const busboy = require("busboy");
 const axios = require("axios");
 const FormData = require("form-data");
 const fs = require("fs");
+const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 const { verifyToken } = require("./authMiddleware");
 
@@ -43,6 +45,232 @@ const supabase = createClient(
 );
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+// ============================================
+// INTERNAL HEALTH MONITORING
+// ============================================
+
+let healthCheckInterval = null;
+let healthStats = {
+    totalChecks: 0,
+    totalFailures: 0,
+    consecutiveFailures: 0,
+    lastCheckTime: null,
+    lastStatus: null,
+    startTime: Date.now()
+};
+
+async function performInternalHealthCheck() {
+    healthStats.totalChecks++;
+    healthStats.lastCheckTime = new Date().toISOString();
+    
+    const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+    let allHealthy = true;
+    const checks = {};
+
+    try {
+        // Check database
+        try {
+            const { error } = await supabase
+                .from("images")
+                .select("id")
+                .limit(1);
+            checks.database = error ? "unhealthy" : "healthy";
+            if (error) allHealthy = false;
+        } catch (err) {
+            checks.database = "unhealthy";
+            allHealthy = false;
+        }
+
+        // Check Telegram API
+        try {
+            const telegramCheck = await axios.get(`${TELEGRAM_API}/getMe`, {
+                timeout: 5000
+            });
+            checks.telegram = telegramCheck.data.ok ? "healthy" : "unhealthy";
+            if (!telegramCheck.data.ok) allHealthy = false;
+        } catch (err) {
+            checks.telegram = "unhealthy";
+            allHealthy = false;
+        }
+
+        // Check storage
+        try {
+            if (!fs.existsSync('uploads')) {
+                fs.mkdirSync('uploads');
+            }
+            checks.storage = "healthy";
+        } catch (err) {
+            checks.storage = "unhealthy";
+            allHealthy = false;
+        }
+
+        const status = allHealthy ? "OK" : "DEGRADED";
+        healthStats.lastStatus = status;
+
+        if (allHealthy) {
+            healthStats.consecutiveFailures = 0;
+            console.log(
+                `\x1b[90m[${timestamp}]\x1b[0m \x1b[32m✓ HEALTH CHECK\x1b[0m - ` +
+                `Status: \x1b[32m${status}\x1b[0m | ` +
+                `DB: \x1b[32m${checks.database}\x1b[0m | ` +
+                `Telegram: \x1b[32m${checks.telegram}\x1b[0m | ` +
+                `Storage: \x1b[32m${checks.storage}\x1b[0m`
+            );
+        } else {
+            healthStats.consecutiveFailures++;
+            healthStats.totalFailures++;
+            console.log(
+                `\x1b[90m[${timestamp}]\x1b[0m \x1b[33m⚠ HEALTH CHECK\x1b[0m - ` +
+                `Status: \x1b[33m${status}\x1b[0m | ` +
+                `DB: ${checks.database === 'healthy' ? '\x1b[32m' : '\x1b[31m'}${checks.database}\x1b[0m | ` +
+                `Telegram: ${checks.telegram === 'healthy' ? '\x1b[32m' : '\x1b[31m'}${checks.telegram}\x1b[0m | ` +
+                `Storage: ${checks.storage === 'healthy' ? '\x1b[32m' : '\x1b[31m'}${checks.storage}\x1b[0m`
+            );
+
+            // Alert on consecutive failures
+            if (healthStats.consecutiveFailures === 5) {
+                console.log(`\x1b[31m⚠️  WARNING: 5 consecutive health check failures!\x1b[0m`);
+            } else if (healthStats.consecutiveFailures === 10) {
+                console.log(`\x1b[31m🚨 CRITICAL: 10 consecutive health check failures!\x1b[0m`);
+            }
+        }
+
+    } catch (error) {
+        healthStats.consecutiveFailures++;
+        healthStats.totalFailures++;
+        healthStats.lastStatus = "ERROR";
+        console.log(
+            `\x1b[90m[${timestamp}]\x1b[0m \x1b[31m✗ HEALTH CHECK ERROR\x1b[0m - ${error.message}`
+        );
+    }
+}
+
+function startHealthMonitoring() {
+    const interval = parseInt(process.env.HEALTH_CHECK_INTERVAL) || 1000; // Default 1 second
+    
+    console.log(`\x1b[36m╔════════════════════════════════════════════════════════════╗\x1b[0m`);
+    console.log(`\x1b[36m║          Internal Health Monitor Started                  ║\x1b[0m`);
+    console.log(`\x1b[36m║  Interval: ${(interval / 1000).toString().padEnd(48)}s║\x1b[0m`);
+    console.log(`\x1b[36m╚════════════════════════════════════════════════════════════╝\x1b[0m`);
+    console.log('');
+
+    // Perform initial check
+    performInternalHealthCheck();
+
+    // Start interval
+    healthCheckInterval = setInterval(performInternalHealthCheck, interval);
+}
+
+function stopHealthMonitoring() {
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+        
+        const uptime = Math.floor((Date.now() - healthStats.startTime) / 1000);
+        const successRate = healthStats.totalChecks > 0 
+            ? ((healthStats.totalChecks - healthStats.totalFailures) / healthStats.totalChecks * 100).toFixed(2)
+            : 0;
+
+        console.log('\n');
+        console.log(`\x1b[36m╔════════════════════════════════════════════════════════════╗\x1b[0m`);
+        console.log(`\x1b[36m║          Health Monitoring Summary                         ║\x1b[0m`);
+        console.log(`\x1b[36m╠════════════════════════════════════════════════════════════╣\x1b[0m`);
+        console.log(`\x1b[36m║\x1b[0m  Total Checks: ${healthStats.totalChecks.toString().padEnd(44)} \x1b[36m║\x1b[0m`);
+        console.log(`\x1b[36m║\x1b[0m  Total Failures: ${healthStats.totalFailures.toString().padEnd(42)} \x1b[36m║\x1b[0m`);
+        console.log(`\x1b[36m║\x1b[0m  Success Rate: ${successRate}%`.padEnd(59) + ` \x1b[36m║\x1b[0m`);
+        console.log(`\x1b[36m║\x1b[0m  Uptime: ${uptime}s`.padEnd(59) + ` \x1b[36m║\x1b[0m`);
+        console.log(`\x1b[36m╚════════════════════════════════════════════════════════════╝\x1b[0m`);
+        console.log('');
+    }
+}
+
+// ============================================
+// HEALTH CHECK ENDPOINT (Public)
+// ============================================
+
+// ============================================
+// HEALTH CHECK ENDPOINT (Public)
+// ============================================
+
+app.get("/health", async (req, res) => {
+    const healthCheck = {
+        status: "ok",
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        monitoring: {
+            enabled: healthCheckInterval !== null,
+            totalChecks: healthStats.totalChecks,
+            totalFailures: healthStats.totalFailures,
+            consecutiveFailures: healthStats.consecutiveFailures,
+            lastCheckTime: healthStats.lastCheckTime,
+            lastStatus: healthStats.lastStatus
+        },
+        checks: {}
+    };
+
+    try {
+        // Check database connection
+        const { data, error } = await supabase
+            .from("images")
+            .select("id")
+            .limit(1);
+
+        healthCheck.checks.database = error ? "unhealthy" : "healthy";
+        
+        if (error) {
+            healthCheck.status = "degraded";
+            healthCheck.checks.databaseError = error.message;
+        }
+
+        // Check Telegram API
+        try {
+            const telegramCheck = await axios.get(`${TELEGRAM_API}/getMe`, {
+                timeout: 5000
+            });
+            healthCheck.checks.telegram = telegramCheck.data.ok ? "healthy" : "unhealthy";
+        } catch (telegramError) {
+            healthCheck.checks.telegram = "unhealthy";
+            healthCheck.checks.telegramError = telegramError.message;
+            healthCheck.status = "degraded";
+        }
+
+        // Check uploads directory
+        try {
+            if (!fs.existsSync('uploads')) {
+                fs.mkdirSync('uploads');
+            }
+            healthCheck.checks.storage = "healthy";
+        } catch (storageError) {
+            healthCheck.checks.storage = "unhealthy";
+            healthCheck.checks.storageError = storageError.message;
+            healthCheck.status = "degraded";
+        }
+
+        // Determine overall status
+        const allHealthy = Object.values(healthCheck.checks)
+            .filter(v => typeof v === 'string')
+            .every(v => v === "healthy");
+
+        if (!allHealthy && healthCheck.status === "ok") {
+            healthCheck.status = "degraded";
+        }
+
+        const statusCode = healthCheck.status === "ok" ? 200 : 503;
+        res.status(statusCode).json(healthCheck);
+
+    } catch (error) {
+        res.status(503).json({
+            status: "unhealthy",
+            timestamp: new Date().toISOString(),
+            error: error.message,
+            monitoring: {
+                enabled: healthCheckInterval !== null,
+                totalChecks: healthStats.totalChecks,
+                totalFailures: healthStats.totalFailures
+            }
+        });
+    }
+});
 
 // ============================================
 // AUTHENTICATION ENDPOINTS
@@ -172,43 +400,201 @@ app.get("/verify", verifyToken, (req, res) => {
 // PROTECTED ROUTES (require authentication)
 // ============================================
 
-// Upload Route
-app.post("/upload", verifyToken, upload.single("image"), async (req, res) => {
+// Optimized Upload Route - Handles multiple large files with streaming
+app.post("/upload", verifyToken, async (req, res) => {
     try {
-        const filePath = req.file.path;
-
-        const form = new FormData();
-        form.append("chat_id", process.env.TELEGRAM_CHAT_ID);
-        form.append("photo", fs.createReadStream(filePath));
-
-        const telegramRes = await axios.post(
-            `${TELEGRAM_API}/sendPhoto`,
-            form,
-            { headers: form.getHeaders() }
-        );
-
-        const message = telegramRes.data.result;
-        const file_id = message.photo.pop().file_id;
-        const message_id = message.message_id;
-
-        const { error } = await supabase.from("images").insert([
-            {
-                file_id,
-                message_id,
-                filename: req.file.originalname,
-                file_size: req.file.size,
-                file_type: req.file.mimetype,
+        const bb = busboy({
+            headers: req.headers,
+            limits: {
+                fileSize: 100 * 1024 * 1024, // 100MB per file limit
+                files: 20, // Max 20 files per request
+                fields: 10,
             },
-        ]);
+        });
 
-        fs.unlinkSync(filePath);
+        const uploadResults = [];
+        const uploadErrors = [];
+        let filesProcessed = 0;
+        let totalFiles = 0;
 
-        if (error) throw error;
+        // Track files being processed
+        const filePromises = [];
 
-        res.json({ success: true });
+        bb.on('file', (fieldname, file, info) => {
+            totalFiles++;
+            const { filename, mimeType } = info;
+
+            // Validate file type (images only)
+            if (!mimeType.startsWith('image/')) {
+                file.resume(); // Drain the stream
+                uploadErrors.push({
+                    filename,
+                    error: 'Only image files are allowed'
+                });
+                filesProcessed++;
+                return;
+            }
+
+            // Create unique temporary file path
+            const tempFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}-${filename}`;
+            const tempFilePath = path.join('uploads', tempFileName);
+
+            // Create write stream
+            const writeStream = fs.createWriteStream(tempFilePath);
+
+            let fileSize = 0;
+            let fileTooLarge = false;
+
+            // Track file size
+            file.on('data', (chunk) => {
+                fileSize += chunk.length;
+            });
+
+            // Handle file size limit
+            file.on('limit', () => {
+                fileTooLarge = true;
+                writeStream.destroy();
+                fs.unlink(tempFilePath, () => {});
+                uploadErrors.push({
+                    filename,
+                    error: 'File too large (max 100MB)'
+                });
+                filesProcessed++;
+            });
+
+            // Pipe file to disk
+            file.pipe(writeStream);
+
+            // Create promise for this file upload
+            const uploadPromise = new Promise((resolve, reject) => {
+                writeStream.on('finish', async () => {
+                    if (fileTooLarge) {
+                        resolve();
+                        return;
+                    }
+
+                    try {
+                        // Upload to Telegram using streaming
+                        const form = new FormData();
+                        form.append("chat_id", process.env.TELEGRAM_CHAT_ID);
+                        form.append("photo", fs.createReadStream(tempFilePath), {
+                            filename: filename,
+                            contentType: mimeType
+                        });
+
+                        const telegramRes = await axios.post(
+                            `${TELEGRAM_API}/sendPhoto`,
+                            form,
+                            { 
+                                headers: form.getHeaders(),
+                                maxContentLength: Infinity,
+                                maxBodyLength: Infinity
+                            }
+                        );
+
+                        const message = telegramRes.data.result;
+                        const file_id = message.photo[message.photo.length - 1].file_id;
+                        const message_id = message.message_id;
+
+                        // Save to database
+                        const { error: dbError } = await supabase.from("images").insert([
+                            {
+                                file_id,
+                                message_id,
+                                filename: filename,
+                                file_size: fileSize,
+                                file_type: mimeType,
+                            },
+                        ]);
+
+                        // Clean up temp file
+                        fs.unlink(tempFilePath, () => {});
+
+                        if (dbError) {
+                            uploadErrors.push({
+                                filename,
+                                error: 'Database error: ' + dbError.message
+                            });
+                        } else {
+                            uploadResults.push({
+                                filename,
+                                file_id,
+                                message_id,
+                                size: fileSize,
+                                success: true
+                            });
+                        }
+
+                        filesProcessed++;
+                        resolve();
+                    } catch (err) {
+                        // Clean up temp file on error
+                        fs.unlink(tempFilePath, () => {});
+                        
+                        uploadErrors.push({
+                            filename,
+                            error: err.response?.data?.description || err.message
+                        });
+                        filesProcessed++;
+                        resolve();
+                    }
+                });
+
+                writeStream.on('error', (err) => {
+                    fs.unlink(tempFilePath, () => {});
+                    uploadErrors.push({
+                        filename,
+                        error: 'Write error: ' + err.message
+                    });
+                    filesProcessed++;
+                    resolve();
+                });
+            });
+
+            filePromises.push(uploadPromise);
+        });
+
+        bb.on('finish', async () => {
+            // Wait for all file uploads to complete
+            await Promise.all(filePromises);
+
+            // Send response
+            const response = {
+                success: uploadResults.length > 0,
+                uploaded: uploadResults.length,
+                failed: uploadErrors.length,
+                total: totalFiles,
+                results: uploadResults
+            };
+
+            if (uploadErrors.length > 0) {
+                response.errors = uploadErrors;
+            }
+
+            if (uploadResults.length === 0 && uploadErrors.length > 0) {
+                return res.status(400).json(response);
+            }
+
+            res.json(response);
+        });
+
+        bb.on('error', (err) => {
+            console.error('Busboy error:', err);
+            res.status(500).json({ 
+                success: false,
+                error: 'Upload processing failed: ' + err.message 
+            });
+        });
+
+        // Pipe request to busboy
+        req.pipe(bb);
+
     } catch (err) {
-        console.error(err.response?.data || err);
-        res.status(500).json({ error: "Upload failed" });
+        console.error('Upload error:', err);
+        res.status(500).json({ 
+            success: false,
+            error: "Upload failed: " + err.message 
+        });
     }
 });
 
@@ -302,9 +688,25 @@ app.delete("/image/:id", verifyToken, async (req, res) => {
 });
 
 
-app.listen(process.env.PORT, () =>
-    console.log(`Server running on port ${process.env.PORT}`)
-);
+app.listen(process.env.PORT, () => {
+    console.log(`Server running on port ${process.env.PORT}`);
+    
+    // Start internal health monitoring
+    startHealthMonitoring();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    stopHealthMonitoring();
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('\nSIGINT signal received: closing HTTP server');
+    stopHealthMonitoring();
+    process.exit(0);
+});
 
 // Export for Vercel serverless
 module.exports = app;
